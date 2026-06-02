@@ -14,7 +14,8 @@
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
     "lint": "tsc --noEmit",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "opencode",
@@ -25,6 +26,12 @@
   ],
   "author": "neomei",
   "license": "MIT",
+  "files": [
+    "dist",
+    "bin",
+    "package.json",
+    "README.md"
+  ],
   "dependencies": {
     "@opencode-ai/sdk": "^1.0.0",
     "@rongcloud/imlib-next": "5.36.6",

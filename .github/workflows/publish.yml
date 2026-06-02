@@ -18,13 +18,39 @@ jobs:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
+      - name: Verify NPM Token
+        run: |
+          echo "Checking npm authentication..."
+          npm whoami || (echo "NPM authentication failed. Please check NPM_TOKEN secret." && exit 1)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Install dependencies
         run: npm ci
 
       - name: Build
         run: npm run build
 
+      - name: Verify Build Output
+        run: |
+          if [ ! -d "dist" ]; then
+            echo "Error: dist/ directory not found after build!"
+            exit 1
+          fi
+          echo "Build output verified."
+          ls -la dist/
+
+      - name: Dry Run Publish
+        run: npm publish --access public --dry-run
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Publish to NPM
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish Success
+        run: |
+          echo "Package published successfully!"
+          echo "Version: $(node -p "require('./package.json').version")"
