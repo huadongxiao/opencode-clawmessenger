@@ -13,6 +13,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
+    "start:win": "chcp 65001 >nul & node dist/cli.js start",
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"

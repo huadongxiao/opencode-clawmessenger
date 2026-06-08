@@ -3,16 +3,16 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import type { ClawMessengerConfig } from './types.js';
-import { getAppKey, getServerUrl } from './auto-register.js';
+import { getServerUrl } from './auto-register.js';
 
 const ClawMessengerConfigSchema = z.object({
-  appKey: z.string().min(1).default(getAppKey()),
+  appKey: z.string().min(1).optional(),
   appSecret: z.string().optional(),
   token: z.string().optional(),
   accountId: z.string().optional(),
   nodeName: z.string().optional(),
   serverUrl: z.string().default(getServerUrl()),
-  opencodeUrl: z.string().default('http://127.0.0.1:19876'),
+  opencodeUrl: z.string().default('http://127.0.0.1:4096'),
   opencodeDir: z.string().optional(),
   opencodePassword: z.string().optional(),
   chatTimeout: z.number().min(1).default(600),

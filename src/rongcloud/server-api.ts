@@ -45,6 +45,7 @@ export class RongCloudServerAPI {
   }
 
   private async requestJSON(path: string, data: any): Promise<any> {
+    this.hostIndex = 0;
     for (let attempt = 0; attempt < API_HOSTS.length; attempt++) {
       const url = `https://${this.host}${path}`;
       try {
@@ -71,6 +72,7 @@ export class RongCloudServerAPI {
   }
 
   private async requestForm(path: string, data: Record<string, any>): Promise<any> {
+    this.hostIndex = 0;
     for (let attempt = 0; attempt < API_HOSTS.length; attempt++) {
       const url = `https://${this.host}${path}`;
       try {

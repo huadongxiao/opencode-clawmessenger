@@ -15,6 +15,7 @@ export class MessageHandler {
   private opencode: OpenCodeClient;
   private opsOpencode: OpenCodeClient;
   private dedup: MessageDeduplicator;
+  // 已读回执在 handleMessage 入口处 fire-and-forget 发送，无需 pending 队列
 
   constructor(
     config: ClawMessengerConfig,
@@ -36,10 +37,20 @@ export class MessageHandler {
 
   async handleMessage(msg: RongCloudMessage): Promise<void> {
     try {
+      // 过滤已读回执消息，避免日志噪音
+      if (msg.messageType === 'RC:ReadNtf') {
+        log.debug({ messageUId: msg.messageUId, senderUserId: msg.senderUserId }, 'Read receipt notification ignored');
+        return;
+      }
+
       if (msg.messageUId && this.dedup.isDuplicate(msg.messageUId)) {
         log.debug({ messageUId: msg.messageUId }, 'Duplicate message filtered');
         return;
       }
+
+      // 发送已读回执（fire-and-forget，不阻塞消息处理）
+      // 在消息去重之后、业务处理之前发送，确保只给实际处理的消息发送已读回执
+      this.sendReadReceipt(msg);
 
       let msgContent: any;
       if (typeof msg.content === 'string') {
@@ -129,20 +140,48 @@ export class MessageHandler {
     } catch (err) {
       log.error({ err }, '处理消息异常');
       try {
-        const errorPayload = JSON.stringify({
-          content: '处理失败，请稍后重试',
-          extra: JSON.stringify({
-            from_node: this.config.accountId,
-            is_ai: true,
-          }),
-        });
-        await this.rongClient.sendMessage(
-          msg.conversationType === 3 ? msg.targetId : msg.senderUserId,
-          errorPayload,
-          msg.conversationType,
-        );
+        const targetId = msg.conversationType === 3 ? msg.targetId : msg.senderUserId;
+        // 不发送错误消息给 system 等虚拟用户（融云 20604 错误）
+        if (targetId && targetId !== 'system') {
+          const errorPayload = JSON.stringify({
+            content: '处理失败，请稍后重试',
+            extra: JSON.stringify({
+              from_node: this.config.accountId,
+              is_ai: true,
+            }),
+          });
+          await this.rongClient.sendMessage(targetId, errorPayload, msg.conversationType);
+        }
       } catch {}
     }
+  }
+
+  /**
+   * 发送已读回执（fire-and-forget，不阻塞消息处理）
+   * 在 handleMessage 入口处调用，支持单聊和群聊
+   */
+  private sendReadReceipt(msg: RongCloudMessage): void {
+    // 跳过自己的消息
+    if (msg.messageDirection === 1) {
+      return;
+    }
+
+    // 需要有效的消息 UID 和时间戳
+    if (!msg.messageUId || !msg.sentTime) {
+      log.debug({ messageUId: msg.messageUId, sentTime: msg.sentTime }, 'Skip read receipt: invalid messageUId or sentTime');
+      return;
+    }
+
+    // 本地生成的 messageUId 无法发送已读回执（已在 client.ts 过滤，此处二次保险）
+    if (String(msg.messageUId).startsWith('local-')) {
+      log.debug({ messageUId: msg.messageUId }, 'Skip read receipt: local messageUId');
+      return;
+    }
+
+    // fire-and-forget：不 await，避免阻塞消息处理
+    this.rongClient.sendReadReceipt(msg).catch((err) => {
+      log.warn({ err, messageUId: msg.messageUId }, 'Failed to send read receipt');
+    });
   }
 
   private async handleChatMessage(data: any, msg: RongCloudMessage, originalMsgType?: string): Promise<void> {
@@ -157,6 +196,14 @@ export class MessageHandler {
 
     if (!content) {
       log.warn('Chat message content is empty');
+      return;
+    }
+
+    // 判断是否是设备对话：有 room_id 表示来自 device-chat.vue
+    const isDeviceChat = !!data?.room_id;
+    if (isDeviceChat) {
+      log.info({ sessionId, roomId: data.room_id }, 'Device chat detected, routing to ops assistant');
+      await this.handleDeviceChat(data, msg, content);
       return;
     }
 
@@ -191,8 +238,53 @@ export class MessageHandler {
     }
   }
 
+  private async handleDeviceChat(data: any, msg: RongCloudMessage, content: string): Promise<void> {
+    const roomId = data.room_id;
+    const requestId = data.request_id || data.requestId;
+    const targetId = data.source_im_id || data.sourceImId || msg.senderUserId;
+
+    log.info({ roomId, targetId, contentLength: content.length }, 'Processing device chat via ops assistant');
+
+    try {
+      // 使用运维助手 OpenCodeClient（19877）同步获取回复
+      const session = await this.opsOpencode.createSession(`Device-${roomId}`);
+      log.info({ sessionId: session.id, roomId }, 'Created ops session for device chat');
+
+      const response = await this.opsOpencode.sendPrompt(session.id, content);
+      log.info({ roomId, responseLength: response.length }, 'Ops assistant responded for device chat');
+
+      // 以 CHAT_MESSAGE 类型回复（匹配前端 device-rongyun-client 预期）
+      const replyPayload = JSON.stringify({
+        msg_type: RongyunMessageTypeEnum.CHAT_MESSAGE,
+        request_id: requestId,
+        content: response,
+        status: 'success',
+        room_id: roomId,
+      });
+
+      await this.rongClient.sendMessage(targetId, replyPayload, msg.conversationType);
+      log.info({ targetId, roomId }, 'Device chat reply sent as CHAT_MESSAGE');
+    } catch (err: any) {
+      log.error({ err, roomId, targetId }, 'Device chat ops assistant failed');
+
+      // 发送错误回复
+      const errorPayload = JSON.stringify({
+        msg_type: RongyunMessageTypeEnum.CHAT_MESSAGE,
+        request_id: requestId,
+        content: '运维助手处理失败: ' + (err.message || '未知错误'),
+        status: 'error',
+        room_id: roomId,
+      });
+
+      await this.rongClient.sendMessage(targetId, errorPayload, msg.conversationType);
+    }
+  }
+
   private async handleCreateOpencodeSession(data: any, msg: RongCloudMessage): Promise<void> {
-    const targetId = data.source_im_id || data.sourceImId;
+    // 群聊(conversationType=3)时 targetId 是群ID，单聊时使用 source_im_id
+    const targetId = msg.conversationType === 3
+      ? msg.targetId
+      : (data.source_im_id || data.sourceImId);
     const title = data.title || '新会话';
 
     try {
@@ -208,7 +300,7 @@ export class MessageHandler {
         timestamp: Math.floor(Date.now() / 1000),
       };
 
-      await this.rongClient.sendMessage(targetId, JSON.stringify(response), 1);
+      await this.rongClient.sendMessage(targetId, JSON.stringify(response), msg.conversationType);
     } catch (err: any) {
       log.error({ err }, '创建 OpenCode 会话失败');
       const errorResponse = {
@@ -219,12 +311,15 @@ export class MessageHandler {
         content: JSON.stringify({ status: 'error', message: err.message }),
         timestamp: Math.floor(Date.now() / 1000),
       };
-      await this.rongClient.sendMessage(targetId, JSON.stringify(errorResponse), 1);
+      await this.rongClient.sendMessage(targetId, JSON.stringify(errorResponse), msg.conversationType);
     }
   }
 
   private async handleDeviceStatusRequest(data: any, msg: RongCloudMessage): Promise<void> {
-    const targetId = data.source_im_id || data.sourceImId || msg.senderUserId;
+    // 群聊(conversationType=3)时 targetId 是群ID，单聊时是发送者ID
+    const targetId = msg.conversationType === 3
+      ? msg.targetId
+      : (data.source_im_id || data.sourceImId || msg.senderUserId);
 
     try {
       const opencodeOk = await checkOpencodeStatus(this.config.opencodeUrl, this.config.opencodePassword);
@@ -244,15 +339,18 @@ export class MessageHandler {
         timestamp: Math.floor(Date.now() / 1000),
       };
 
-      await this.rongClient.sendMessage(targetId, JSON.stringify(report), 1);
+      await this.rongClient.sendMessage(targetId, JSON.stringify(report), msg.conversationType);
     } catch (err: any) {
       log.error({ err }, '设备状态查询异常');
     }
   }
 
   private async handleDeviceControl(data: any, msg: RongCloudMessage): Promise<void> {
-    const targetId = data.source_im_id || data.sourceImId || msg.senderUserId;
-    
+    // 群聊(conversationType=3)时 targetId 是群ID，单聊时是发送者ID
+    const targetId = msg.conversationType === 3
+      ? msg.targetId
+      : (data.source_im_id || data.sourceImId || msg.senderUserId);
+
     // 解析 content 字段中的 JSON（文档规范：content 包含 {"cmd": 1}）
     let commandContent: any = {};
     try {
@@ -264,7 +362,7 @@ export class MessageHandler {
     } catch {
       commandContent = {};
     }
-    
+
     const cmd = commandContent.cmd;
     const cmdNames: Record<number, string> = {
       1: 'start',
@@ -274,9 +372,9 @@ export class MessageHandler {
       5: 'config_fix',
     };
     const cmdName = cmdNames[cmd] || `unknown(${cmd})`;
-    
+
     log.info({ targetId, cmd, cmdName }, 'Processing device control');
-    
+
     const result = {
       msg_type: RongyunMessageTypeEnum.DEVICE_CONTROL_RESULT,
       request_id: data.request_id,
@@ -286,7 +384,7 @@ export class MessageHandler {
       message: `命令 ${cmdName} 已接收`,
       timestamp: Math.floor(Date.now() / 1000),
     };
-    await this.rongClient.sendMessage(targetId, JSON.stringify(result), 1);
+    await this.rongClient.sendMessage(targetId, JSON.stringify(result), msg.conversationType);
   }
 
   private async handleCommand(data: any, msg: RongCloudMessage): Promise<void> {
@@ -317,6 +415,12 @@ export class MessageHandler {
     const payload = data.payload || {};
     const sourceId = data.source_im_id || data.sourceImId || msg.senderUserId;
     const destinationId = data.destination_im_id || data.destinationImId || msg.targetId;
+
+    // 过滤无效命令：service/action 为空时不处理（避免回复给 system 等虚拟用户）
+    if (!service || !action) {
+      log.debug({ requestId, senderUserId: msg.senderUserId }, 'Skipping command with empty service/action');
+      return;
+    }
 
     log.info({ requestId, service, action }, 'Handling command');
 
@@ -356,7 +460,7 @@ export class MessageHandler {
       timestamp: Date.now(),
     };
 
-    await this.rongClient.sendMessage(sourceId, JSON.stringify(response), 1);
+    await this.rongClient.sendMessage(sourceId, JSON.stringify(response), msg.conversationType);
   }
 
   // ========== Command Handlers ==========
@@ -439,7 +543,10 @@ export class MessageHandler {
   }
 
   private async handleOpsChatMessage(data: any, msg: RongCloudMessage): Promise<void> {
-    const targetId = data.source_im_id || data.sourceImId || msg.senderUserId;
+    // 群聊(conversationType=3)时 targetId 是群ID，单聊时是发送者ID
+    const targetId = msg.conversationType === 3
+      ? msg.targetId
+      : (data.source_im_id || data.sourceImId || msg.senderUserId);
     const content = data.message || data.content || '';
     const nodeId = data.node_id || data.nodeId;
     const requestId = data.request_id || data.requestId;
@@ -476,6 +583,7 @@ export class MessageHandler {
           from_node: this.config.accountId,
           is_ai: true,
           msg_type: RongyunMessageTypeEnum.OPS_CHAT_RESPONSE,
+          chat_type: 'ops',
         }),
       });
       

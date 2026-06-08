@@ -37,28 +37,20 @@ function stringToUtf8Bytes(str: string): number[] {
   return bytes;
 }
 
-function toBase64(bytes: number[]): string {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  let result = '';
+const B64U = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+
+function toBase64url(bytes: number[]): string {
+  let res = '';
   for (let i = 0; i < bytes.length; i += 3) {
     const a = bytes[i];
     const b = i + 1 < bytes.length ? bytes[i + 1] : 0;
     const c = i + 2 < bytes.length ? bytes[i + 2] : 0;
-    result += chars[a >> 2];
-    result += chars[((a & 3) << 4) | (b >> 4)];
-    result += i + 1 < bytes.length ? chars[((b & 15) << 2) | (c >> 6)] : '=';
-    result += i + 2 < bytes.length ? chars[c & 63] : '=';
+    res += B64U[a >> 2];
+    res += B64U[((a & 3) << 4) | (b >> 4)];
+    if (i + 1 < bytes.length) res += B64U[((b & 15) << 2) | (c >> 6)];
+    if (i + 2 < bytes.length) res += B64U[c & 63];
   }
-  return result;
-}
-
-function checksum(bytes: number[]): number[] {
-  let a = 0x67452301, b = 0xefcdab89;
-  for (let i = 0; i < bytes.length; i++) {
-    a = ((a << 5) - a + bytes[i] + b) | 0;
-    b = ((b << 3) - b + bytes[i] + a) | 0;
-  }
-  return [(a >> 24) & 0xff, (a >> 16) & 0xff, (a >> 8) & 0xff, a & 0xff];
+  return res;
 }
 
 export function encryptQR(plaintext: string): string {
@@ -72,11 +64,6 @@ export function encryptQR(plaintext: string): string {
     cipherBytes.push(plainBytes[i] ^ key[keyIdx]);
   }
 
-  const cs = checksum(plainBytes);
-  const payload = [...iv, ...cipherBytes, ...cs];
-
-  const base64 = toBase64(payload);
-  const urlSafeBase64 = base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-
-  return 'v2:' + urlSafeBase64;
+  const payload = [...iv, ...cipherBytes];
+  return 'v3:' + toBase64url(payload);
 }

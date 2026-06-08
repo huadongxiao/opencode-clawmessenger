@@ -7,6 +7,16 @@ import { startStandalone } from './standalone.js';
 import { createLogger } from './core/logger.js';
 import { PID_FILE, spawnDaemon, writePid, readPid, isProcessAlive, readStatus, statusFileAgeMs, HEARTBEAT_STALE_AFTER_MS, cleanupPid } from './core/daemon.js';
 
+// Windows UTF-8 encoding fix - must be at the very top
+if (process.platform === 'win32') {
+  try {
+    const { execSync } = require('child_process');
+    execSync('chcp 65001', { stdio: 'ignore' });
+    // @ts-ignore
+    process.env.FORCE_UTF8 = '1';
+  } catch {}
+}
+
 const log = createLogger('cli');
 
 function getVersion(): string {
@@ -214,9 +224,9 @@ program
             const { nodeId, qrData } = await generateBindQR();
             try {
               const QRCode = await import('qrcode');
-              await QRCode.toString(qrData, { type: 'terminal', small: true }, (err: any, str: string) => {
-                if (!err) console.log(str);
-              });
+              // 生成终端 ASCII 二维码
+              const qrString = await QRCode.toString(qrData, { type: 'terminal', small: false });
+              console.log('\n' + qrString + '\n');
             } catch {
               console.log('QR Data:', qrData);
             }
@@ -258,18 +268,23 @@ program
     console.log('========================================\n');
 
     const { nodeId, qrData } = await generateBindQR(nodeName);
+    
+    // 方法1: 生成终端 ASCII 二维码（最兼容）
     try {
       const QRCode = await import('qrcode');
-      await QRCode.toString(qrData, { type: 'terminal', small: true }, (err: any, str: string) => {
-        if (!err) console.log(str);
-      });
-    } catch {
-      console.log('QR Data:', qrData);
+      const qrString = await QRCode.toString(qrData, { type: 'terminal', small: false });
+      console.log('\n' + qrString + '\n');
+    } catch (err) {
+      console.log('QR Code generation failed:', err);
     }
-
-    console.log(`\nNode ID: ${nodeId}`);
-    console.log('Tip: Open App -> AI Assistant -> Scan QR to Add');
-    console.log('\nAfter binding, users can chat with the agent via ClawMessenger!');
+    
+    console.log('\n----------------------------------------');
+    console.log('Alternative binding methods:');
+    console.log('----------------------------------------');
+    console.log(`Node ID: ${nodeId}`);
+    console.log(`Encrypted: ${qrData.substring(0, 50)}...`);
+    console.log('\nIf QR scan fails, use manual input in app');
+    console.log('Tip: Open App -> OpenClaw -> Manual Add');
     console.log('\nStart the plugin: opencode-clawmessenger start');
 
     rl.close();

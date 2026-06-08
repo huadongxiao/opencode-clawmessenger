@@ -244,11 +244,33 @@ export async function checkOpencodeStatus(opencodeUrl: string, password?: string
   if (password) {
     headers['Authorization'] = `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`;
   }
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3000);
-    const response = await fetch(opencodeUrl, { method: 'GET', headers, signal: controller.signal });
-    clearTimeout(timeoutId);
-    return response.ok || response.status === 401;
-  } catch { return false; }
+  
+  // 尝试多个端点，因为不同版本的 OpenCode 可能响应不同的路径
+  const endpoints = [
+    `${opencodeUrl}/health`,
+    `${opencodeUrl}/api/health`,
+    `${opencodeUrl}/v1/health`,
+    opencodeUrl,  // 最后尝试根路径
+  ];
+  
+  for (const url of endpoints) {
+    try {
+      log.debug({ url }, 'Trying OpenCode health endpoint');
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2000);
+      const response = await fetch(url, { method: 'GET', headers, signal: controller.signal });
+      clearTimeout(timeoutId);
+      
+      if (response.ok || response.status === 401) {
+        log.info({ url, status: response.status }, 'OpenCode status check success');
+        return true;
+      }
+    } catch (err: any) {
+      log.debug({ url, err: err.message }, 'OpenCode endpoint check failed');
+      // 继续尝试下一个端点
+    }
+  }
+  
+  log.warn({ opencodeUrl }, 'OpenCode status check failed on all endpoints');
+  return false;
 }
