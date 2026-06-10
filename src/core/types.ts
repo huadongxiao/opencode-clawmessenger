@@ -8,6 +8,7 @@ export interface ClawMessengerConfig {
   opencodeUrl: string;
   opencodeDir: string;
   opencodePassword?: string;
+  apiBaseUrl?: string;
   chatTimeout?: number;
 }
 
@@ -27,6 +28,8 @@ export interface RongCloudMessage {
 export interface RongyunMessage {
   msg_type: string;
   content?: string;
+  voiceUrl?: string;
+  voiceDuration?: number;
   request_id?: string;
   source_im_id?: string;
   room_id?: string;
@@ -66,6 +69,7 @@ export interface SessionInfo {
   status: 'idle' | 'busy';
   lastUpdateTime?: number;
   currentContent?: string;
+  extra?: Record<string, any>;
 }
 
 export interface HookConfig {

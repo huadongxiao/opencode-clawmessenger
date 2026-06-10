@@ -15,6 +15,7 @@ const ClawMessengerConfigSchema = z.object({
   opencodeUrl: z.string().default('http://127.0.0.1:4096'),
   opencodeDir: z.string().optional(),
   opencodePassword: z.string().optional(),
+  apiBaseUrl: z.string().optional(),
   chatTimeout: z.number().min(1).default(600),
   hooks: z.object({
     onSessionCreated: z.string().optional(),
@@ -49,6 +50,7 @@ export class ConfigManager {
       opencodeUrl: process.env.CLAW_OPENCODE_URL,
       opencodeDir: process.env.CLAW_OPENCODE_DIR,
       opencodePassword: process.env.OPENCODE_SERVER_PASSWORD,
+      apiBaseUrl: process.env.CLAW_API_BASE_URL,
       chatTimeout: process.env.CLAW_CHAT_TIMEOUT ? parseInt(process.env.CLAW_CHAT_TIMEOUT, 10) : undefined,
     };
 

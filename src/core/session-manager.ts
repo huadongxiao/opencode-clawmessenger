@@ -96,6 +96,15 @@ export class SessionManager {
     }
   }
 
+  updateExtra(chatId: string, extra: Record<string, any>): void {
+    const session = this.sessions.get(chatId);
+    if (session) {
+      session.extra = { ...session.extra, ...extra };
+      log.info({ chatId, extraKeys: Object.keys(extra) }, 'Session extra updated');
+      this.scheduleSave();
+    }
+  }
+
   deleteSession(chatId: string): void {
     this.sessions.delete(chatId);
     this.scheduleSave();

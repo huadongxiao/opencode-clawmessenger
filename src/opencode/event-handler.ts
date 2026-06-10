@@ -64,6 +64,22 @@ export class EventHandler {
     this.isRunning = false;
   }
 
+  /**
+   * 获取发送者ID
+   * 对于客服聊天，使用客服账号ID作为发送者，而不是当前节点ID
+   * 这样可以确保客服消息和普通消息在不同的会话中
+   */
+  private getFromUserId(sessionId: string): string {
+    const chatId = this.sessionManager.getChatIdBySession(sessionId);
+    if (chatId) {
+      const session = this.sessionManager.getSession(chatId);
+      if (session?.extra?.serviceTargetId) {
+        return session.extra.serviceTargetId;
+      }
+    }
+    return this.config.accountId;
+  }
+
   private async handleEvent(globalEvent: any): Promise<void> {
     try {
       const payload = globalEvent.payload || globalEvent;
@@ -146,7 +162,7 @@ export class EventHandler {
         fullContent: '',
         hasSentStream: false,
         chatId,
-        targetId: chatId.replace('claw-', ''),
+        targetId: chatId.startsWith('group_') ? chatId.replace('group_', '') : (chatId.startsWith('service-') ? chatId.replace('service-', '') : chatId.replace('claw-', '')),
         isGroup: chatId.startsWith('group_'),
       };
       this.streamStates.set(sessionId, streamState);
@@ -166,7 +182,7 @@ export class EventHandler {
 
         if (streamState!.isGroup) {
           const result = await this.streamAPI.sendStreamGroup({
-            fromUserId: this.config.accountId,
+            fromUserId: this.getFromUserId(sessionId),
             toGroupId: streamState!.targetId,
             content: delta,
             isFirstChunk,
@@ -177,7 +193,7 @@ export class EventHandler {
           if (result.messageUID) streamState!.messageUID = result.messageUID;
         } else {
           const result = await this.streamAPI.sendStreamPrivate({
-            fromUserId: this.config.accountId,
+            fromUserId: this.getFromUserId(sessionId),
             toUserId: streamState!.targetId,
             content: delta,
             isFirstChunk,
@@ -221,7 +237,7 @@ export class EventHandler {
         try {
           if (streamState.isGroup) {
             await this.streamAPI.sendStreamGroup({
-              fromUserId: this.config.accountId,
+              fromUserId: this.getFromUserId(sessionId),
               toGroupId: streamState.targetId,
               content: '',
               isFirstChunk: false,
@@ -231,7 +247,7 @@ export class EventHandler {
             });
           } else {
             await this.streamAPI.sendStreamPrivate({
-              fromUserId: this.config.accountId,
+              fromUserId: this.getFromUserId(sessionId),
               toUserId: streamState.targetId,
               content: '',
               isFirstChunk: false,
@@ -282,16 +298,32 @@ export class EventHandler {
       return;
     }
 
-    // 没有流式发送过时，兜底发送完整普通消息
+    // 没有流式发送过时，兜底发送完整消息
     const text = await this.opencode.fetchLastMessageText(sessionId);
     log.info({ sessionId, chatId, hasText: !!text }, 'Fetched last message');
 
     if (text) {
-      const targetId = chatId.replace('claw-', '');
-      log.info({ targetId, textLength: text.length }, 'Sending reply via normal message');
+      const isGroup = chatId.startsWith('group_');
+      const isServiceChat = chatId.startsWith('service-');
+      const targetId = isGroup ? chatId.replace('group_', '') : (isServiceChat ? chatId.replace('service-', '') : chatId.replace('claw-', ''));
+      const conversationType = isGroup ? 3 : 1;
+      log.info({ targetId, textLength: text.length, isGroup, isServiceChat }, 'Sending reply via normal message');
 
-      // 直接发送文本内容（前端期望的格式）
-      await this.rongClient.sendMessage(targetId, text, 1);
+      if (isServiceChat) {
+        // 客服会话：发送 service_chat_response 格式的自定义消息
+        const servicePayload = JSON.stringify({
+          msg_type: 'service_chat_response',
+          content: text,
+          sessionId: sessionId,
+          userId: targetId,
+          status: 'success',
+          timestamp: Math.floor(Date.now() / 1000),
+        });
+        await this.rongClient.sendMessage(targetId, servicePayload, conversationType);
+      } else {
+        // 普通会话：直接发送文本内容
+        await this.rongClient.sendMessage(targetId, text, conversationType);
+      }
     }
 
     this.sessionManager.updateStatus(chatId, 'idle');
@@ -325,8 +357,8 @@ export class EventHandler {
       return;
     }
 
-    const targetId = chatId.replace('claw-', '');
     const isGroup = chatId.startsWith('group_');
+    const targetId = isGroup ? chatId.replace('group_', '') : (chatId.startsWith('service-') ? chatId.replace('service-', '') : chatId.replace('claw-', ''));
 
     try {
       const text = await this.opencode.fetchLastMessageText(sessionId);
@@ -349,7 +381,7 @@ export class EventHandler {
         fullContent: '',
         hasSentStream: false,
         chatId,
-        targetId: chatId.replace('claw-', ''),
+        targetId: chatId.startsWith('group_') ? chatId.replace('group_', '') : (chatId.startsWith('service-') ? chatId.replace('service-', '') : chatId.replace('claw-', '')),
         isGroup: chatId.startsWith('group_'),
       };
       this.streamStates.set(sessionId, streamState);
@@ -369,7 +401,7 @@ export class EventHandler {
         try {
           if (isGroup) {
             const result = await this.streamAPI.sendStreamGroup({
-              fromUserId: this.config.accountId,
+              fromUserId: this.getFromUserId(sessionId),
               toGroupId: targetId,
               content: newContent,
               isFirstChunk: streamState!.seq === 1,
@@ -380,7 +412,7 @@ export class EventHandler {
             if (result.messageUID) streamState!.messageUID = result.messageUID;
           } else {
             const result = await this.streamAPI.sendStreamPrivate({
-              fromUserId: this.config.accountId,
+              fromUserId: this.getFromUserId(sessionId),
               toUserId: targetId,
               content: newContent,
               isFirstChunk: streamState!.seq === 1,
@@ -488,11 +520,13 @@ export class EventHandler {
     }
 
     log.error({ sessionId: properties.sessionID, error: errorMessage }, 'Session error');
-    const targetId = chatId.replace('claw-', '');
+    const isGroup = chatId.startsWith('group_');
+    const targetId = isGroup ? chatId.replace('group_', '') : chatId.replace('claw-', '');
+    const conversationType = isGroup ? 3 : 1;
 
     // 发送错误消息（直接文本格式）
     const errorText = `AI 处理出错: ${errorMessage}`;
-    await this.rongClient.sendMessage(targetId, errorText, 1);
+    await this.rongClient.sendMessage(targetId, errorText, conversationType);
     this.sessionManager.updateStatus(chatId, 'idle');
   }
 }

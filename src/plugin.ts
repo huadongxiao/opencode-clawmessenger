@@ -77,6 +77,20 @@ const ClawMessengerPlugin: Plugin = {
         rongClient.disconnect();
         await sessionManager.cleanup();
       },
+      /**
+       * 发送消息给指定用户或群组
+       * @param targetId 目标用户ID或群组ID
+       * @param content 消息内容（纯文本或JSON字符串）
+       * @param options 可选参数：conversationType(1=私聊,3=群聊，默认1)、extra(额外JSON字段)
+       * @returns { success: boolean, messageUId?: string, error?: string }
+       *
+       * 使用示例：
+       * - 私聊：await plugin.sendToUser('user123', '你好')
+       * - 群聊：await plugin.sendToUser('group456', '大家好', { conversationType: 3 })
+       * - 带额外数据：await plugin.sendToUser('admin', '需要添加知识库', { extra: { category: 'knowledge' } })
+       */
+      sendToUser: (targetId: string, content: string, options?: { conversationType?: number; extra?: Record<string, any> }) =>
+        messageHandler.sendToUser(targetId, content, options),
     };
   },
 };

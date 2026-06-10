@@ -5,6 +5,7 @@ import { SessionManager } from './session-manager.js';
 import { RongCloudClient } from '../rongcloud/client.js';
 import { OpenCodeClient, checkOpencodeStatus } from '../opencode/client.js';
 import { createLogger } from './logger.js';
+import axios from 'axios';
 
 const log = createLogger('MessageHandler');
 
@@ -15,7 +16,8 @@ export class MessageHandler {
   private opencode: OpenCodeClient;
   private opsOpencode: OpenCodeClient;
   private dedup: MessageDeduplicator;
-  // 已读回执在 handleMessage 入口处 fire-and-forget 发送，无需 pending 队列
+  // Command 消息请求等待队列（用于语音识别等异步操作）
+  private pendingRequests: Map<string, { resolve: (value: any) => void; reject: (reason: any) => void; timer: NodeJS.Timeout }>;
 
   constructor(
     config: ClawMessengerConfig,
@@ -33,6 +35,42 @@ export class MessageHandler {
       directory: '/home/neomei/文档/projects/ops-assistant',
     });
     this.dedup = new MessageDeduplicator();
+    this.pendingRequests = new Map();
+  }
+
+  /**
+   * 发送消息给指定用户或群组
+   * 供 agent 智能体调用，支持：
+   * - 私聊：sendToUser('userId', '消息内容')
+   * - 群聊：sendToUser('groupId', '消息内容', { conversationType: 3 })
+   */
+  async sendToUser(
+    targetId: string,
+    content: string,
+    options: { conversationType?: number; extra?: Record<string, any> } = {},
+  ): Promise<{ success: boolean; messageUId?: string; error?: string }> {
+    const { conversationType = 1, extra } = options;
+
+    if (!targetId || !content) {
+      log.warn({ targetId, hasContent: !!content }, 'sendToUser: 缺少 targetId 或 content');
+      return { success: false, error: '缺少 targetId 或 content' };
+    }
+
+    try {
+      let messageContent: string;
+      if (extra && Object.keys(extra).length > 0) {
+        messageContent = JSON.stringify({ content, ...extra });
+      } else {
+        messageContent = content;
+      }
+
+      await this.rongClient.sendMessage(targetId, messageContent, conversationType);
+      log.info({ targetId, conversationType, contentPreview: content.substring(0, 100) }, 'sendToUser: 消息发送成功');
+      return { success: true };
+    } catch (err: any) {
+      log.error({ err, targetId, conversationType }, 'sendToUser: 消息发送失败');
+      return { success: false, error: err.message || String(err) };
+    }
   }
 
   async handleMessage(msg: RongCloudMessage): Promise<void> {
@@ -78,6 +116,12 @@ export class MessageHandler {
         source_im_id: sourceImId,
         destination_im_id: destinationImId,
       };
+
+      // 过滤系统通知消息（前端通过 __sys_notify__ 标记发送），避免AI响应
+      if (msgContent.__sys_notify__ === true || innerContent.__sys_notify__ === true) {
+        log.debug({ messageType: msg.messageType, text: msgContent.text || innerContent.text }, 'System notification ignored');
+        return;
+      }
 
       log.info({ 
         messageType: msg.messageType, 
@@ -126,12 +170,27 @@ export class MessageHandler {
           await this.handleOpsChatMessage(merged, msg);
           return;
 
+        case RongyunMessageTypeEnum.CREATE_SERVICE_SESSION:
+        case 'create_service_session':
+          await this.handleCreateServiceSession(merged, msg);
+          return;
+
+        case RongyunMessageTypeEnum.SERVICE_CHAT_MESSAGE:
+        case 'service_chat_message':
+          await this.handleServiceChatMessage(merged, msg);
+          return;
+
         case RongyunMessageTypeEnum.DELETE_OPENCODE_SESSION:
         case 'delete_opencode_session':
           if (merged.session_id) {
             this.sessionManager.deleteSession(merged.session_id);
             await this.opencode.deleteSession(merged.session_id);
           }
+          return;
+
+        case RongyunMessageTypeEnum.COMMAND_RESULT:
+        case 'command_result':
+          this.handleCommandResult(merged, msg);
           return;
 
         default:
@@ -185,7 +244,10 @@ export class MessageHandler {
   }
 
   private async handleChatMessage(data: any, msg: RongCloudMessage, originalMsgType?: string): Promise<void> {
-    const sessionId = data?.session_id || `claw-${msg.senderUserId}`;
+    const isGroup = msg.conversationType === 3;
+    // 群聊时使用 group_<groupId> 作为 chatId，让 event-handler 正确识别为群聊并回复到群里
+    const chatId = isGroup ? `group_${msg.targetId}` : `claw-${msg.senderUserId}`;
+    const sessionId = data?.session_id || chatId;
 
     let content = '';
     if (data?.content) {
@@ -207,20 +269,65 @@ export class MessageHandler {
       return;
     }
 
-    log.info({ sessionId, contentLength: content.length }, 'Processing chat message');
-    this.sessionManager.updateStatus(sessionId, 'busy');
+    // 群聊 @ 判断逻辑
+    if (isGroup) {
+      // 从多个可能的位置提取 mentionedInfo（msg.content 可能是字符串或对象）
+      let msgContentMentioned: any;
+      if (msg.content && typeof msg.content === 'object') {
+        msgContentMentioned = msg.content.mentionedInfo || msg.content.mentioned_info;
+      } else if (typeof msg.content === 'string') {
+        try {
+          const parsed = JSON.parse(msg.content);
+          msgContentMentioned = parsed.mentionedInfo || parsed.mentioned_info;
+        } catch {}
+      }
+      const mentionedInfo = data?.mentionedInfo || data?.mentioned_info || msgContentMentioned;
+      log.info({ 
+        sessionId, 
+        chatId, 
+        content, 
+        mentionedInfo: JSON.stringify(mentionedInfo),
+        dataKeys: Object.keys(data || {}),
+        accountId: this.config.accountId 
+      }, 'Group chat mention check');
+      
+      if (mentionedInfo) {
+        const userIdList = mentionedInfo.userIdList || mentionedInfo.user_id_list || [];
+        // 融云 @所有人 的判断：userIdList 为空数组（无论 type 是 1 还是 2）
+        // 实际测试发现 @所有人 时 type=1 且 userIdList=[]，@特定用户时 type=2 且有具体 userId
+        const isAllMentioned = !userIdList || userIdList.length === 0;
+        const isMentioned = isAllMentioned || userIdList.includes(this.config.accountId);
+        
+        log.info({ 
+          userIdList, 
+          isAllMentioned, 
+          isMentioned, 
+          accountId: this.config.accountId 
+        }, 'Mention check result');
+        
+        if (!isMentioned) {
+          // @了别的用户，当前 AI 不回复
+          log.info('Not mentioned, skipping group chat reply');
+          return;
+        }
+      }
+      // 没有 @ 任何人，或者 @ 了当前 AI，继续处理
+    }
+
+    log.info({ sessionId, chatId, isGroup, contentLength: content.length }, 'Processing chat message');
+    this.sessionManager.updateStatus(chatId, 'busy');
 
     try {
-      const session = await this.sessionManager.getOrCreateSession(sessionId, `ClawMessenger ${msg.senderUserId}`);
+      const session = await this.sessionManager.getOrCreateSession(chatId, `ClawMessenger ${isGroup ? msg.targetId : msg.senderUserId}`);
       const isChatMessage = originalMsgType === 'chat_message' || originalMsgType === RongyunMessageTypeEnum.CHAT_MESSAGE;
 
       // 使用异步模式，通过 SSE 事件流实时推送回复
       // OpenCode 会自动加载 directory 下的 .opencode/prompt.md 作为 system prompt
       await this.opencode.sendPromptAsync(session.id, content);
-      log.info({ sessionId, opencodeSessionId: session.id }, 'promptAsync sent, streaming via SSE');
+      log.info({ sessionId, chatId, opencodeSessionId: session.id }, 'promptAsync sent, streaming via SSE');
     } catch (err) {
-      log.error({ err, sessionId }, '处理聊天消息失败');
-      this.sessionManager.updateStatus(sessionId, 'idle');
+      log.error({ err, sessionId, chatId }, '处理聊天消息失败');
+      this.sessionManager.updateStatus(chatId, 'idle');
       try {
         const errorPayload = JSON.stringify({
           content: '消息处理失败，请稍后重试',
@@ -463,6 +570,35 @@ export class MessageHandler {
     await this.rongClient.sendMessage(sourceId, JSON.stringify(response), msg.conversationType);
   }
 
+  /**
+   * 处理 command_result 消息（响应回调）
+   * 用于语音识别等异步操作的响应
+   */
+  private handleCommandResult(data: any, msg: RongCloudMessage): void {
+    const requestId = data.requestId || data.request_id;
+    if (!requestId) {
+      log.warn('Command result missing requestId');
+      return;
+    }
+
+    const pending = this.pendingRequests.get(requestId);
+    if (!pending) {
+      log.warn({ requestId }, 'No pending request found for command result');
+      return;
+    }
+
+    clearTimeout(pending.timer);
+    this.pendingRequests.delete(requestId);
+
+    if (data.status === 'success' && data.code === 200) {
+      pending.resolve(data.data);
+    } else {
+      pending.reject(new Error(data.message || '语音识别失败'));
+    }
+
+    log.info({ requestId, status: data.status, code: data.code }, 'Command result processed');
+  }
+
   // ========== Command Handlers ==========
 
   private async _handle_user_getInfo(payload: any, fromUserId: string): Promise<any> {
@@ -540,6 +676,159 @@ export class MessageHandler {
         serverUrl: this.config.serverUrl,
       },
     };
+  }
+
+  private async handleCreateServiceSession(data: any, msg: RongCloudMessage): Promise<void> {
+    const userId = data.userId || data.user_id || msg.senderUserId;
+    const targetId = msg.senderUserId;
+    const requestId = data.request_id || data.requestId;
+
+    log.info({ userId, targetId, requestId }, 'Processing create service session');
+
+    try {
+      const chatId = `service-${userId}`;
+      const session = await this.sessionManager.getOrCreateSession(chatId, `客服会话 ${userId}`);
+
+      const response = {
+        msg_type: RongyunMessageTypeEnum.SERVICE_SESSION_CREATED,
+        request_id: requestId,
+        userId: userId,
+        sessionId: session.id,
+        status: 'success',
+        message: '客服会话创建成功',
+        timestamp: Math.floor(Date.now() / 1000),
+      };
+
+      await this.rongClient.sendMessage(targetId, JSON.stringify(response), msg.conversationType);
+      log.info({ userId, sessionId: session.id }, 'Service session created');
+    } catch (err: any) {
+      log.error({ err, userId }, '创建客服会话失败');
+      const errorResponse = {
+        msg_type: RongyunMessageTypeEnum.SERVICE_SESSION_CREATED,
+        request_id: requestId,
+        userId: userId,
+        status: 'error',
+        message: err.message || '创建会话失败',
+        timestamp: Math.floor(Date.now() / 1000),
+      };
+      await this.rongClient.sendMessage(targetId, JSON.stringify(errorResponse), msg.conversationType);
+    }
+  }
+
+  /**
+   * 语音识别：通过融云 command 消息发送识别请求，等待 command_result 响应
+   * 不再使用 HTTP 调用，改为 RongCloud 消息通道
+   */
+  private async _recognizeVoice(voiceUrl: string): Promise<string> {
+    const requestId = `vr_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+    return new Promise((resolve, reject) => {
+      // 30秒超时
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(requestId);
+        reject(new Error('语音识别请求超时'));
+      }, 30000);
+
+      this.pendingRequests.set(requestId, { resolve, reject, timer });
+
+      const commandPayload = {
+        msg_type: RongyunMessageTypeEnum.COMMAND,
+        requestId: requestId,
+        service: 'ai',
+        action: 'recognizeVoice',
+        payload: {
+          voiceUrl: voiceUrl,
+          format: 'm4a',
+          sampleRate: 16000,
+        },
+        timestamp: Date.now(),
+      };
+
+      // 发送给 system 用户（Python server 端处理）
+      this.rongClient.sendMessage('system', JSON.stringify(commandPayload), 1)
+        .then(() => {
+          log.info({ requestId, voiceUrl }, 'Voice recognition command sent via RongCloud');
+        })
+        .catch((err: any) => {
+          clearTimeout(timer);
+          this.pendingRequests.delete(requestId);
+          log.error({ err: err.message, requestId }, 'Failed to send voice recognition command');
+          reject(new Error('发送语音识别请求失败: ' + (err.message || '未知错误')));
+        });
+    }).then((data: any) => {
+      const text = data?.text || data?.result || '';
+      if (!text) {
+        throw new Error('语音识别结果为空');
+      }
+      log.info({ voiceUrl, recognizedTextPreview: text.substring(0, 100) }, 'Voice recognized via RongCloud');
+      return text;
+    });
+  }
+
+  private async handleServiceChatMessage(data: any, msg: RongCloudMessage): Promise<void> {
+    const userId = data.userId || data.user_id || msg.senderUserId;
+    const sessionId = data.sessionId || data.session_id;
+    let content = data.content || '';
+    const targetId = msg.senderUserId;
+    const requestId = data.request_id || data.requestId;
+
+    // 处理语音消息：如果有 voiceUrl，先进行语音识别
+    if (data.voiceUrl && !content) {
+      try {
+        content = await this._recognizeVoice(data.voiceUrl);
+        log.info({ userId, voiceUrl: data.voiceUrl, recognizedLength: content.length }, 'Voice message recognized');
+      } catch (err: any) {
+        log.error({ err, userId, voiceUrl: data.voiceUrl }, 'Voice recognition failed for service chat');
+        const errorPayload = JSON.stringify({
+          msg_type: RongyunMessageTypeEnum.SERVICE_CHAT_RESPONSE,
+          request_id: requestId,
+          content: '语音消息识别失败，请稍后重试或发送文字消息',
+          sessionId: sessionId || '',
+          userId: userId,
+          status: 'error',
+          timestamp: Math.floor(Date.now() / 1000),
+        });
+        await this.rongClient.sendMessage(targetId, errorPayload, msg.conversationType);
+        return;
+      }
+    }
+
+    if (!content) {
+      log.warn('Service chat message content is empty');
+      return;
+    }
+
+    log.info({ userId, sessionId, contentLength: content.length }, 'Processing service chat message');
+
+    try {
+      const chatId = `service-${userId}`;
+      const session = await this.sessionManager.getOrCreateSession(chatId, `客服会话 ${userId}`);
+
+      // 保存客服目标账号ID到 session，供 event-handler 发送回复时使用
+      // 这样客服回复的 fromUserId 会是客服账号，而不是当前节点ID
+      const serviceTargetId = msg.targetId || this.config.accountId;
+      this.sessionManager.updateExtra(chatId, { serviceTargetId });
+      log.info({ userId, sessionId: session.id, serviceTargetId }, 'Service session created with targetId');
+
+      // 使用异步模式触发 SSE 流式输出，由 event-handler 处理流式消息发送
+      // 最终回复会在 session.idle 时以 service_chat_response 格式发送
+      await this.opencode.sendPromptAsync(session.id, content);
+      log.info({ userId, sessionId: session.id }, 'Service promptAsync sent, streaming via SSE');
+    } catch (err: any) {
+      log.error({ err, userId, targetId }, 'Service assistant failed');
+
+      const errorPayload = JSON.stringify({
+        msg_type: RongyunMessageTypeEnum.SERVICE_CHAT_RESPONSE,
+        request_id: requestId,
+        content: '客服处理失败: ' + (err.message || '未知错误'),
+        sessionId: sessionId || '',
+        userId: userId,
+        status: 'error',
+        timestamp: Math.floor(Date.now() / 1000),
+      });
+
+      await this.rongClient.sendMessage(targetId, errorPayload, msg.conversationType);
+    }
   }
 
   private async handleOpsChatMessage(data: any, msg: RongCloudMessage): Promise<void> {
