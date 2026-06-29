@@ -11,6 +11,7 @@ const DEFAULT_STORAGE_PATH = join(homedir(), '.config', 'opencode', 'clawmesseng
 interface PersistedSession {
   chatId: string;
   sessionId: string;
+  title?: string;
 }
 
 interface PersistedState {
@@ -36,7 +37,13 @@ export class SessionManager {
     if (existing) {
       try {
         const alive = await this.opencode.sessionExists(existing.id);
-        if (alive) return existing;
+        if (alive) {
+          if (title && existing.extra?.title !== title) {
+            existing.extra = { ...existing.extra, title };
+            this.scheduleSave();
+          }
+          return existing;
+        }
         // Only delete if explicitly confirmed not alive, not on error
         this.sessions.delete(chatId);
       } catch (err) {
@@ -55,6 +62,8 @@ export class SessionManager {
         id: session.id,
         chatId,
         status: 'idle',
+        lastUpdateTime: Date.now(),
+        extra: { title: title || `ClawMessenger ${chatId}` },
       };
       this.sessions.set(chatId, info);
       log.info({ chatId, sessionId: session.id }, 'Created new session');
@@ -92,6 +101,7 @@ export class SessionManager {
     const session = this.sessions.get(chatId);
     if (session) {
       session.status = status;
+      session.lastUpdateTime = Date.now();
       log.info({ chatId, status }, 'Session status updated');
     }
   }
@@ -100,6 +110,7 @@ export class SessionManager {
     const session = this.sessions.get(chatId);
     if (session) {
       session.extra = { ...session.extra, ...extra };
+      session.lastUpdateTime = Date.now();
       log.info({ chatId, extraKeys: Object.keys(extra) }, 'Session extra updated');
       this.scheduleSave();
     }
@@ -132,6 +143,7 @@ export class SessionManager {
             id: s.sessionId,
             chatId: s.chatId,
             status: 'idle',
+            extra: s.title ? { title: s.title } : undefined,
           });
         }
         log.info({ count: data.sessions.length }, 'Restored sessions');
@@ -152,6 +164,7 @@ export class SessionManager {
       sessions: Array.from(this.sessions.entries()).map(([chatId, info]) => ({
         chatId,
         sessionId: info.id,
+        title: typeof info.extra?.title === 'string' ? info.extra.title : undefined,
       })),
     };
     try {

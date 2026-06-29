@@ -228,10 +228,7 @@ export class MessageHandler {
 
         case RongyunMessageTypeEnum.DELETE_OPENCODE_SESSION:
         case 'delete_opencode_session':
-          if (merged.session_id) {
-            this.sessionManager.deleteSession(merged.session_id);
-            await this.opencode.deleteSession(merged.session_id);
-          }
+          await this.handleDeleteOpencodeSession(merged, msg);
           return;
 
         case RongyunMessageTypeEnum.COMMAND_RESULT:
@@ -474,6 +471,47 @@ export class MessageHandler {
     }
   }
 
+  private async handleDeleteOpencodeSession(data: any, msg: RongCloudMessage): Promise<void> {
+    const targetId = isSharedConversation(msg.conversationType)
+      ? msg.targetId
+      : (data.source_im_id || data.sourceImId || msg.senderUserId);
+    const requestedId = String(data.session_id || data.sessionId || '').trim();
+    const response = {
+      msg_type: RongyunMessageTypeEnum.COMMAND_RESULT,
+      request_id: data.request_id || data.requestId,
+      source_im_id: data.destination_im_id || data.destinationImId || msg.targetId,
+      destination_im_id: targetId,
+      content: '',
+      timestamp: Math.floor(Date.now() / 1000),
+    };
+
+    try {
+      if (!requestedId) throw new Error('缺少会话 ID');
+      const session = this.sessionManager.getSession(requestedId)
+        || this.sessionManager.getSessionByOpencodeId(requestedId);
+      const chatId = session?.chatId || requestedId;
+      const opencodeSessionId = session?.id || requestedId;
+
+      await this.opencode.deleteSession(opencodeSessionId);
+      this.sessionManager.deleteSession(chatId);
+      response.content = JSON.stringify({
+        status: 'success',
+        session_id: chatId,
+        opencode_session_id: opencodeSessionId,
+      });
+    } catch (err: any) {
+      log.error({ err, requestedId }, '删除 OpenCode 会话失败');
+      response.content = JSON.stringify({
+        status: 'error',
+        message: err?.message || '删除会话失败',
+      });
+    }
+
+    if (targetId) {
+      await this.rongClient.sendMessage(targetId, JSON.stringify(response), msg.conversationType);
+    }
+  }
+
   private async handleDeviceStatusRequest(data: any, msg: RongCloudMessage): Promise<void> {
     // 群聊(conversationType=3)时 targetId 是群ID，单聊时是发送者ID
     const targetId = isSharedConversation(msg.conversationType)
@@ -490,6 +528,13 @@ export class MessageHandler {
         open_claw_status: opencodeOk ? 1 : 0,
         status_message: opencodeOk ? '运行中' : '未运行',
         version: 'unknown',
+        sessions: this.sessionManager.getAllSessions().map((session) => ({
+          sessionKey: session.chatId,
+          sessionId: session.id,
+          label: typeof session.extra?.title === 'string' ? session.extra.title : session.chatId,
+          state: session.status === 'busy' ? 'active' : 'idle',
+          updatedAt: session.lastUpdateTime || null,
+        })),
         timestamp: Date.now(),
       };
 
