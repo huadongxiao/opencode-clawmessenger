@@ -11,6 +11,7 @@ export class RongCloudClient {
   private _isConnected = false;
   private messageHandler?: (msg: RongCloudMessage) => void;
   private sentMessageUIds = new Set<string>();
+  private receivedMessageUIds = new Set<string>();
   private CommandMessage: any;
   private ServiceChatMessage: any;
   private OpsChatMessage: any;
@@ -19,6 +20,8 @@ export class RongCloudClient {
   private DeviceStatusReportMessage: any;
   private DeviceControlMessage: any;
   private DeviceControlResultMessage: any;
+  private ChatroomInviteMessage: any;
+  private joinedChatrooms = new Set<string>();
 
   constructor(config: { appKey: string; token: string; accountId: string }, log: Logger) {
     this.config = config;
@@ -52,7 +55,8 @@ export class RongCloudClient {
         this.DeviceStatusReportMessage = RongIMLib.registerMessageType('device_status_report', false, false);
         this.DeviceControlMessage = RongIMLib.registerMessageType('device_control', false, false);
         this.DeviceControlResultMessage = RongIMLib.registerMessageType('device_control_result', false, false);
-        this.log.info('自定义消息类型已注册 (command, service_chat, ops_chat_message, ops_chat_response, device_status_request, device_status_report, device_control, device_control_result)');
+        this.ChatroomInviteMessage = RongIMLib.registerMessageType('chatroom_invite', true, false);
+        this.log.info('自定义消息类型已注册 (command, service_chat, ops_chat_message, ops_chat_response, device_status_request, device_status_report, device_control, device_control_result, chatroom_invite)');
       }
     } catch (err: any) {
       this.log.warn({ err }, '注册自定义消息类型失败');
@@ -89,6 +93,7 @@ export class RongCloudClient {
       RongIMLib.addEventListener(RongIMLib.Events?.DISCONNECT || 'DISCONNECT', (code: any) => {
         this.log.warn({ code }, '融云断开连接');
         this._isConnected = false;
+        this.joinedChatrooms.clear();
       });
 
       // 监听所有可能的事件用于调试
@@ -124,6 +129,27 @@ export class RongCloudClient {
     }
   }
 
+  async joinChatroom(targetId: string, historyCount = 0): Promise<void> {
+    if (!targetId) throw new Error('Chatroom id is required');
+    if (this.joinedChatrooms.has(targetId)) return;
+    if (!this._isConnected) throw new Error('RongCloud not connected');
+
+    const options = { count: historyCount };
+    let result = typeof RongIMLib.joinExistChatRoom === 'function'
+      ? await RongIMLib.joinExistChatRoom(targetId, options)
+      : await RongIMLib.joinChatRoom(targetId, options);
+
+    // 23410 表示当前集群尚未找到聊天室，兼容旧环境使用创建并加入接口重试。
+    if (result?.code === 23410 && typeof RongIMLib.joinChatRoom === 'function') {
+      result = await RongIMLib.joinChatRoom(targetId, options);
+    }
+    if (result?.code !== 0 && result?.code !== 200) {
+      throw new Error(`RongCloud join chatroom failed: code=${result?.code ?? 'unknown'}`);
+    }
+    this.joinedChatrooms.add(targetId);
+    this.log.info({ targetId }, '已加入融云聊天室');
+  }
+
   private handleReceivedMessage(message: RongCloudMessage): void {
     try {
       // 打印所有收到的消息（用于调试）
@@ -152,9 +178,28 @@ export class RongCloudClient {
         this.log.info({ messageType: message.messageType, messageUId: message.messageUId }, '忽略已发送消息');
         return;
       }
-      if (message.isOffLineMessage) {
-        this.log.info({ messageType: message.messageType, senderUserId: message.senderUserId }, '忽略离线消息');
+      if (message.messageUId && this.receivedMessageUIds.has(message.messageUId)) {
+        this.log.info({ messageType: message.messageType, messageUId: message.messageUId }, '忽略重复收到的消息');
         return;
+      }
+      if (message.isOffLineMessage) {
+        const sentTime = message.sentTime || message.timestamp || 0;
+        const ageMs = sentTime > 0 ? Date.now() - sentTime : Number.POSITIVE_INFINITY;
+        // 短暂断线或刚加入群组时，融云可能把最新群消息标记为离线消息。
+        // 只丢弃超过 5 分钟的历史积压，近期消息继续交给 AI 处理。
+        if (ageMs > 5 * 60 * 1000) {
+          this.log.info({ messageType: message.messageType, senderUserId: message.senderUserId, ageMs }, '忽略过期离线消息');
+          return;
+        }
+        this.log.info({ messageType: message.messageType, senderUserId: message.senderUserId, ageMs }, '处理近期离线消息');
+      }
+
+      if (message.messageUId) {
+        this.receivedMessageUIds.add(message.messageUId);
+        if (this.receivedMessageUIds.size > 500) {
+          const first = this.receivedMessageUIds.values().next().value;
+          if (first) this.receivedMessageUIds.delete(first);
+        }
       }
 
       this.log.info({

@@ -17,6 +17,36 @@ interface StreamState {
   chatId: string;
   targetId: string;
   isGroup: boolean;
+  conversationType: number;
+}
+
+interface ChatRoute {
+  targetId: string;
+  conversationType: number;
+  isGroup: boolean;
+  isChatroom: boolean;
+  isServiceChat: boolean;
+}
+
+function getChatRoute(chatId: string): ChatRoute {
+  const isGroup = chatId.startsWith('group_');
+  const isChatroom = chatId.startsWith('chatroom_');
+  const isServiceChat = chatId.startsWith('service-');
+  const targetId = isGroup
+    ? chatId.replace('group_', '')
+    : isChatroom
+      ? chatId.replace('chatroom_', '')
+      : isServiceChat
+        ? chatId.replace('service-', '')
+        : chatId.replace('claw-', '');
+
+  return {
+    targetId,
+    conversationType: isGroup ? 3 : isChatroom ? 4 : 1,
+    isGroup,
+    isChatroom,
+    isServiceChat,
+  };
 }
 
 export class EventHandler {
@@ -143,7 +173,12 @@ export class EventHandler {
     if (typeof delta !== 'string') {
       return;
     }
-    // 注意：空字符串的 delta 是合法的（无新内容块），不跳过，继续执行以维持流状态
+    // OpenCode 会发送不含正文的 delta 通知。不能用空增量初始化流，
+    // 否则后续真正带正文的 part.updated 会被误判为“已有流”而忽略。
+    if (delta.length === 0) {
+      log.debug({ sessionId }, 'Ignoring empty stream delta');
+      return;
+    }
 
     // 初始化流式状态
     let streamState = this.streamStates.get(sessionId);
@@ -154,6 +189,8 @@ export class EventHandler {
         return;
       }
 
+      const route = getChatRoute(chatId);
+
       streamState = {
         messageUID: '',
         seq: 1,  // 融云要求 seq 从 1 开始
@@ -162,14 +199,22 @@ export class EventHandler {
         fullContent: '',
         hasSentStream: false,
         chatId,
-        targetId: chatId.startsWith('group_') ? chatId.replace('group_', '') : (chatId.startsWith('service-') ? chatId.replace('service-', '') : chatId.replace('claw-', '')),
-        isGroup: chatId.startsWith('group_'),
+        targetId: route.targetId,
+        isGroup: route.isGroup,
+        conversationType: route.conversationType,
       };
       this.streamStates.set(sessionId, streamState);
     }
 
     // 累积完整内容
     streamState.fullContent += delta;
+
+    // 融云服务端流式接口仅支持单聊和群聊。聊天室先累计正文，
+    // 等 session.idle 后用 conversationType=4 发送完整消息。
+    if (streamState.conversationType === 4) {
+      streamState.lastContent = streamState.fullContent;
+      return;
+    }
 
     log.info({ sessionId, seq: streamState.seq, deltaLength: delta.length }, 'Sending stream delta');
 
@@ -229,7 +274,7 @@ export class EventHandler {
     const streamState = this.streamStates.get(sessionId);
 
     // 如果已发送过流式片段，发送结束标记和 __stream_history__
-    if (streamState && streamState.hasSentStream) {
+    if (streamState && streamState.hasSentStream && streamState.fullContent.length > 0) {
       log.info({ sessionId, streamSeq: streamState.seq }, 'Finishing stream with last chunk');
 
       // 发送结束流式片段
@@ -272,7 +317,7 @@ export class EventHandler {
             text: streamState.fullContent,
             sentTime: Date.now(),
           });
-          await this.rongClient.sendMessage(streamState.targetId, historyContent, streamState.isGroup ? 3 : 1);
+          await this.rongClient.sendMessage(streamState.targetId, historyContent, streamState.conversationType);
           log.info({ sessionId, textLength: streamState.fullContent.length }, 'Stream history sent');
         } catch (err) {
           log.error({ err, sessionId }, 'Failed to send stream history');
@@ -285,8 +330,9 @@ export class EventHandler {
       return;
     }
 
-    // 清理流式状态（如果存在但未发送过流式）
+    // 空流或未发送过正文时清理状态，让下方 fetchLastMessageText 发送完整回复。
     if (streamState) {
+      log.warn({ sessionId, hasSentStream: streamState.hasSentStream }, 'Empty stream detected, falling back to full reply');
       this.streamStates.delete(sessionId);
     }
 
@@ -303,11 +349,9 @@ export class EventHandler {
     log.info({ sessionId, chatId, hasText: !!text }, 'Fetched last message');
 
     if (text) {
-      const isGroup = chatId.startsWith('group_');
-      const isServiceChat = chatId.startsWith('service-');
-      const targetId = isGroup ? chatId.replace('group_', '') : (isServiceChat ? chatId.replace('service-', '') : chatId.replace('claw-', ''));
-      const conversationType = isGroup ? 3 : 1;
-      log.info({ targetId, textLength: text.length, isGroup, isServiceChat }, 'Sending reply via normal message');
+      const route = getChatRoute(chatId);
+      const { targetId, conversationType, isGroup, isChatroom, isServiceChat } = route;
+      log.info({ targetId, textLength: text.length, isGroup, isChatroom, isServiceChat }, 'Sending reply via normal message');
 
       if (isServiceChat) {
         // 客服会话：发送 service_chat_response 格式的自定义消息
@@ -357,8 +401,8 @@ export class EventHandler {
       return;
     }
 
-    const isGroup = chatId.startsWith('group_');
-    const targetId = isGroup ? chatId.replace('group_', '') : (chatId.startsWith('service-') ? chatId.replace('service-', '') : chatId.replace('claw-', ''));
+    const route = getChatRoute(chatId);
+    const { isGroup, targetId } = route;
 
     try {
       const text = await this.opencode.fetchLastMessageText(sessionId);
@@ -373,6 +417,9 @@ export class EventHandler {
         return;
       }
 
+
+      const streamRoute = getChatRoute(chatId);
+
       streamState = {
         messageUID: '',
         seq: 1,  // 融云要求 seq 从 1 开始
@@ -381,8 +428,9 @@ export class EventHandler {
         fullContent: '',
         hasSentStream: false,
         chatId,
-        targetId: chatId.startsWith('group_') ? chatId.replace('group_', '') : (chatId.startsWith('service-') ? chatId.replace('service-', '') : chatId.replace('claw-', '')),
-        isGroup: chatId.startsWith('group_'),
+        targetId: streamRoute.targetId,
+        isGroup: streamRoute.isGroup,
+        conversationType: streamRoute.conversationType,
       };
       this.streamStates.set(sessionId, streamState);
     }
@@ -393,6 +441,11 @@ export class EventHandler {
 
       // 累积完整内容
       streamState.fullContent += newContent;
+
+      if (streamState.conversationType === 4) {
+        streamState.lastContent = text;
+        return;
+      }
 
       log.info({ sessionId, seq: streamState.seq, newLength: newContent.length }, 'Sending stream chunk (from part.updated)');
 
@@ -520,9 +573,7 @@ export class EventHandler {
     }
 
     log.error({ sessionId: properties.sessionID, error: errorMessage }, 'Session error');
-    const isGroup = chatId.startsWith('group_');
-    const targetId = isGroup ? chatId.replace('group_', '') : chatId.replace('claw-', '');
-    const conversationType = isGroup ? 3 : 1;
+    const { targetId, conversationType } = getChatRoute(chatId);
 
     // 发送错误消息（直接文本格式）
     const errorText = `AI 处理出错: ${errorMessage}`;

@@ -9,6 +9,10 @@ import axios from 'axios';
 
 const log = createLogger('MessageHandler');
 
+const isSharedConversation = (conversationType: number): boolean => (
+  conversationType === 3 || conversationType === 4
+);
+
 export class MessageHandler {
   private config: ClawMessengerConfig;
   private sessionManager: SessionManager;
@@ -134,6 +138,15 @@ export class MessageHandler {
       }, 'Message received details');
 
       switch (customMsgType || msg.messageType) {
+        case 'chatroom_invite': {
+          const chatroomId = merged.chatroom_id || merged.chatroomId;
+          if (chatroomId) {
+            await this.rongClient.joinChatroom(String(chatroomId));
+            log.info({ chatroomId }, '聊天室邀请已接收并完成加入');
+          }
+          return;
+        }
+
         case RongyunMessageTypeEnum.CREATE_OPENCODE_SESSION:
         case 'create_opencode_session':
           await this.handleCreateOpencodeSession(merged, msg);
@@ -205,7 +218,7 @@ export class MessageHandler {
     } catch (err) {
       log.error({ err }, '处理消息异常');
       try {
-        const targetId = msg.conversationType === 3 ? msg.targetId : msg.senderUserId;
+        const targetId = isSharedConversation(msg.conversationType) ? msg.targetId : msg.senderUserId;
         // 不发送错误消息给 system 等虚拟用户（融云 20604 错误）
         if (targetId && targetId !== 'system') {
           const errorPayload = JSON.stringify({
@@ -251,8 +264,14 @@ export class MessageHandler {
 
   private async handleChatMessage(data: any, msg: RongCloudMessage, originalMsgType?: string): Promise<void> {
     const isGroup = msg.conversationType === 3;
-    // 群聊时使用 group_<groupId> 作为 chatId，让 event-handler 正确识别为群聊并回复到群里
-    const chatId = isGroup ? `group_${msg.targetId}` : `claw-${msg.senderUserId}`;
+    const isChatroom = msg.conversationType === 4;
+    const isShared = isGroup || isChatroom;
+    // 群聊和聊天室都必须按多人会话目标建会话，否则聊天室回复会误发到发送者私聊。
+    const chatId = isGroup
+      ? `group_${msg.targetId}`
+      : isChatroom
+        ? `chatroom_${msg.targetId}`
+        : `claw-${msg.senderUserId}`;
     const sessionId = data?.session_id || chatId;
 
     let content = '';
@@ -320,11 +339,11 @@ export class MessageHandler {
       // 没有 @ 任何人，或者 @ 了当前 AI，继续处理
     }
 
-    log.info({ sessionId, chatId, isGroup, contentLength: content.length }, 'Processing chat message');
+    log.info({ sessionId, chatId, isGroup, isChatroom, contentLength: content.length }, 'Processing chat message');
     this.sessionManager.updateStatus(chatId, 'busy');
 
     try {
-      const session = await this.sessionManager.getOrCreateSession(chatId, `ClawMessenger ${isGroup ? msg.targetId : msg.senderUserId}`);
+      const session = await this.sessionManager.getOrCreateSession(chatId, `ClawMessenger ${isShared ? msg.targetId : msg.senderUserId}`);
       const isChatMessage = originalMsgType === 'chat_message' || originalMsgType === RongyunMessageTypeEnum.CHAT_MESSAGE;
 
       // 使用异步模式，通过 SSE 事件流实时推送回复
@@ -343,7 +362,7 @@ export class MessageHandler {
           }),
         });
         await this.rongClient.sendMessage(
-          msg.conversationType === 3 ? msg.targetId : msg.senderUserId,
+          isSharedConversation(msg.conversationType) ? msg.targetId : msg.senderUserId,
           errorPayload,
           msg.conversationType,
         );
@@ -395,7 +414,7 @@ export class MessageHandler {
 
   private async handleCreateOpencodeSession(data: any, msg: RongCloudMessage): Promise<void> {
     // 群聊(conversationType=3)时 targetId 是群ID，单聊时使用 source_im_id
-    const targetId = msg.conversationType === 3
+    const targetId = isSharedConversation(msg.conversationType)
       ? msg.targetId
       : (data.source_im_id || data.sourceImId);
     const title = data.title || '新会话';
@@ -430,13 +449,17 @@ export class MessageHandler {
 
   private async handleDeviceStatusRequest(data: any, msg: RongCloudMessage): Promise<void> {
     // 群聊(conversationType=3)时 targetId 是群ID，单聊时是发送者ID
-    const targetId = msg.conversationType === 3
+    const targetId = isSharedConversation(msg.conversationType)
       ? msg.targetId
       : (data.source_im_id || data.sourceImId || msg.senderUserId);
 
     try {
       const opencodeOk = await checkOpencodeStatus(this.config.opencodeUrl, this.config.opencodePassword);
       const statusData = {
+        runtime_type: 'opencode',
+        node_type: 'opencode',
+        opencode_status: opencodeOk ? 1 : 0,
+        // Legacy field kept for older mobile and Web clients.
         open_claw_status: opencodeOk ? 1 : 0,
         status_message: opencodeOk ? '运行中' : '未运行',
         version: 'unknown',
@@ -460,7 +483,7 @@ export class MessageHandler {
 
   private async handleDeviceControl(data: any, msg: RongCloudMessage): Promise<void> {
     // 群聊(conversationType=3)时 targetId 是群ID，单聊时是发送者ID
-    const targetId = msg.conversationType === 3
+    const targetId = isSharedConversation(msg.conversationType)
       ? msg.targetId
       : (data.source_im_id || data.sourceImId || msg.senderUserId);
 
@@ -814,7 +837,11 @@ export class MessageHandler {
       });
 
       try {
-        await this.rongClient.sendMessage(msg.senderUserId, errorPayload, msg.conversationType);
+        await this.rongClient.sendMessage(
+          isSharedConversation(msg.conversationType) ? msg.targetId : msg.senderUserId,
+          errorPayload,
+          msg.conversationType,
+        );
       } catch (sendErr) {
         log.error({ sendErr }, 'Failed to send voice recognition error message');
       }
@@ -889,7 +916,7 @@ export class MessageHandler {
 
   private async handleOpsChatMessage(data: any, msg: RongCloudMessage): Promise<void> {
     // 群聊(conversationType=3)时 targetId 是群ID，单聊时是发送者ID
-    const targetId = msg.conversationType === 3
+    const targetId = isSharedConversation(msg.conversationType)
       ? msg.targetId
       : (data.source_im_id || data.sourceImId || msg.senderUserId);
     const content = data.message || data.content || '';
