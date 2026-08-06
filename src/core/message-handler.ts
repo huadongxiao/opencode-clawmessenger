@@ -138,6 +138,33 @@ export class MessageHandler {
       }, 'Message received details');
 
       switch (customMsgType || msg.messageType) {
+        case 'chatroom_message': {
+          const chatroomId = String(merged.chatroom_id || merged.chatroomId || '');
+          const originMessageUId = String(merged.origin_message_uid || merged.originMessageUId || '');
+          if (!chatroomId || !merged.content) {
+            log.warn({ chatroomId, hasContent: !!merged.content }, '聊天室可靠投递消息缺少必要字段');
+            return;
+          }
+          // 聊天室原生消息与私聊可靠投递可能同时到达，用原始 messageUId 保证只处理一次。
+          if (originMessageUId && this.dedup.isDuplicate(originMessageUId)) {
+            log.debug({ originMessageUId, chatroomId }, '聊天室消息已通过原生通道处理，跳过可靠投递副本');
+            return;
+          }
+          await this.rongClient.joinChatroom(chatroomId);
+          await this.handleChatMessage(
+            merged,
+            {
+              ...msg,
+              conversationType: 4,
+              targetId: chatroomId,
+              messageUId: originMessageUId || msg.messageUId,
+              isOffLineMessage: false,
+            },
+            'chat_message',
+          );
+          return;
+        }
+
         case 'chatroom_invite': {
           const chatroomId = merged.chatroom_id || merged.chatroomId;
           if (chatroomId) {
