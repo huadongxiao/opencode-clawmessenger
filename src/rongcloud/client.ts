@@ -3,7 +3,11 @@ import * as RongIMLibModule from '@rongcloud/imlib-next';
 import type { Logger } from '../core/logger.js';
 import type { RongCloudMessage } from '../core/types.js';
 
+import { failureCode } from './auth-codes.js';
+
 const RongIMLib: any = RongIMLibModule;
+
+export { AUTHENTICATION_ERROR_CODES } from './auth-codes.js';
 
 export class RongCloudClient {
   private config: { appKey: string; token: string; accountId: string };
@@ -22,6 +26,7 @@ export class RongCloudClient {
   private DeviceControlResultMessage: any;
   private ChatroomInviteMessage: any;
   private joinedChatrooms = new Set<string>();
+  private _lastFailureCode?: number;
 
   constructor(config: { appKey: string; token: string; accountId: string }, log: Logger) {
     this.config = config;
@@ -32,7 +37,16 @@ export class RongCloudClient {
     return this._isConnected;
   }
 
-  async connect(handler: (msg: RongCloudMessage) => void): Promise<{ success: boolean; userId?: string }> {
+  /** Last RongCloud error code seen while connecting or after a disconnect. */
+  get lastFailureCode(): number | undefined {
+    return this._lastFailureCode;
+  }
+
+  setToken(token: string): void {
+    this.config.token = token;
+  }
+
+  async connect(handler: (msg: RongCloudMessage) => void): Promise<{ success: boolean; userId?: string; code?: number }> {
     this.messageHandler = handler;
     this.log.info({ appKey: this.config.appKey, accountId: this.config.accountId }, '开始连接融云...');
 
@@ -92,6 +106,7 @@ export class RongCloudClient {
 
       RongIMLib.addEventListener(RongIMLib.Events?.DISCONNECT || 'DISCONNECT', (code: any) => {
         this.log.warn({ code }, '融云断开连接');
+        this._lastFailureCode = failureCode(code);
         this._isConnected = false;
         this.joinedChatrooms.clear();
       });
@@ -110,6 +125,7 @@ export class RongCloudClient {
     try {
       const result = await RongIMLib.connect(this.config.token);
       if (result.code === 0 || result.code === 200) {
+        this._lastFailureCode = undefined;
         const userId = result.data?.userId;
         this.log.info({ userId }, '融云登录成功');
         this._isConnected = true;
@@ -120,12 +136,14 @@ export class RongCloudClient {
         }
         return { success: true, userId };
       } else {
+        this._lastFailureCode = result.code;
         this.log.error({ code: result.code }, '融云登录失败');
-        return { success: false };
+        return { success: false, code: result.code };
       }
     } catch (err: any) {
+      this._lastFailureCode = failureCode(err);
       this.log.error({ err }, '融云连接异常');
-      return { success: false };
+      return { success: false, code: failureCode(err) };
     }
   }
 

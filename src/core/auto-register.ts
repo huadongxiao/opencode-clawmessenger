@@ -64,19 +64,20 @@ export async function registerNode(
     }
 
     if (response.data?.code === 409) {
-      log?.info('节点已存在，获取 Token...');
-      const tokenResp = await axios.get(`${serverUrl}/api/claw/token/${nodeId}`, { timeout: 10000 });
-      if (tokenResp.data?.code === 200) {
-        const token = tokenResp.data.data?.token || tokenResp.data.token || '';
-        if (!token) {
-          log?.error('获取 token 接口未返回 token');
-          return { nodeId, nodeName: nickname, token: '', success: false };
-        }
+      log?.info('节点已存在，换发 Token...');
+      try {
+        const token = await refreshNodeToken(
+          serverUrl,
+          response.data.data?.node_id || response.data.node_id || nodeId,
+          nickname,
+          log,
+        );
         await saveAutoConfig({ nodeId, nodeName: nickname, token, macAddress });
         return { nodeId, nodeName: nickname, token, success: true };
+      } catch (err: any) {
+        log?.error(`换发 token 失败: ${err?.message || err}`);
+        return { nodeId, nodeName: nickname, token: '', success: false };
       }
-      log?.error(`获取 token 失败: ${tokenResp.data?.message || '未知错误'}`);
-      return { nodeId, nodeName: nickname, token: '', success: false };
     }
 
     log?.error(`注册失败: code=${response.data?.code}, message=${response.data?.message}`);
@@ -107,6 +108,90 @@ export async function getOrRegisterToken(
 
   log?.error('获取 token 失败');
   return '';
+}
+
+/** 节点已迁移到设备凭据：必须通过配对重新登记身份，无法再用 refresh-token 换发。 */
+export class DeviceCredentialRequiredError extends Error {
+  constructor() {
+    super('节点已启用设备凭据，需要通过配对重新登记节点身份（或升级到支持设备凭据的节点版本）');
+    this.name = 'DeviceCredentialRequiredError';
+  }
+}
+
+function isDeviceCredentialRequired(err: unknown): boolean {
+  const response = (err as { response?: { status?: number; data?: { error?: string } } } | undefined)?.response;
+  return response?.status === 409 && String(response.data?.error || '') === 'device_credential_required';
+}
+
+let deviceCredentialRequired = false;
+
+/**
+ * 通过服务端换发节点融云 Token（服务端接口: POST /api/claw/refresh-token/<node_id>）。
+ * 融云 Token 到期后连接会返回 31004，此时必须换发而不是重新注册，否则会产生重复节点。
+ */
+export async function refreshNodeToken(
+  serverUrl: string = DEFAULT_SERVER_URL,
+  nodeId: string,
+  nodeName?: string,
+  log?: Logger,
+): Promise<string> {
+  let response;
+  try {
+    response = await axios.post(
+      `${serverUrl}/api/claw/refresh-token/${encodeURIComponent(nodeId)}`,
+      { name: nodeName || undefined },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 25_000 },
+    );
+  } catch (err) {
+    if (isDeviceCredentialRequired(err)) throw new DeviceCredentialRequiredError();
+    throw err;
+  }
+  const token = response.data?.data?.token;
+  if (response.data?.code !== 200 || typeof token !== 'string' || !token) {
+    throw new Error(`刷新 token 失败: code=${response.data?.code ?? 'unknown'}`);
+  }
+  return token;
+}
+
+/** 使用已保存的 nodeId 换发 token，并写回本地配置。失败时返回空字符串。 */
+export async function refreshRegisteredToken(
+  serverUrl?: string,
+  nodeName?: string,
+  log?: Logger,
+): Promise<string> {
+  if (deviceCredentialRequired) {
+    log?.warn('节点需要设备凭据，已停止自动换发 token；请重新配对后再启动');
+    return '';
+  }
+  const existingConfig = await loadAutoConfig();
+  if (!existingConfig?.nodeId) {
+    log?.warn('本地缺少 nodeId，无法换发 token');
+    return '';
+  }
+  try {
+    const token = await refreshNodeToken(
+      serverUrl || DEFAULT_SERVER_URL,
+      existingConfig.nodeId,
+      nodeName || existingConfig.nodeName,
+      log,
+    );
+    await saveAutoConfig({
+      nodeId: existingConfig.nodeId,
+      nodeName: existingConfig.nodeName,
+      token,
+      macAddress: existingConfig.macAddress,
+    });
+    log?.info(`token 已换发, nodeId=${existingConfig.nodeId}`);
+    return token;
+  } catch (err: any) {
+    if (err instanceof DeviceCredentialRequiredError) {
+      deviceCredentialRequired = true;
+      log?.error(`${err.message}；已停止自动换发 token`);
+      return '';
+    }
+    log?.error(`换发 token 失败: ${err?.message || err}`);
+    return '';
+  }
 }
 
 async function saveAutoConfig(config: any): Promise<void> {

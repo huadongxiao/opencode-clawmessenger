@@ -2,13 +2,14 @@ import { ConfigManager } from './core/config.js';
 import { SessionManager } from './core/session-manager.js';
 import { MessageHandler } from './core/message-handler.js';
 import { RongCloudClient } from './rongcloud/client.js';
+import { connectWithTokenRefresh } from './rongcloud/token-refresh.js';
 import { OpenCodeClient, checkOpencodeStatus } from './opencode/client.js';
 import { EventHandler } from './opencode/event-handler.js';
 import { createLogger } from './core/logger.js';
 import { startStatusWriter } from './core/daemon.js';
-import { getOrRegisterToken, loadAutoConfig, generateNodeId, getAppKey, getAppSecret } from './core/auto-register.js';
+import { getOrRegisterToken, loadAutoConfig, generateNodeId, getAppKey, getAppSecret, refreshRegisteredToken } from './core/auto-register.js';
 import { encryptQR } from './core/qr-crypto.js';
-import type { ClawMessengerConfig } from './core/types.js';
+import type { ClawMessengerConfig, RongCloudMessage } from './core/types.js';
 import { hostname } from 'os';
 
 const log = createLogger('standalone');
@@ -136,11 +137,25 @@ export async function startStandalone(options: StartStandaloneOptions = {}): Pro
     console.warn('  Event streaming disabled\n');
   }
 
-  const connectResult = await rongClient.connect((msg) => {
+  const messageSink = (msg: RongCloudMessage) => {
     messageHandler.handleMessage(msg).catch((err) => {
       log.error({ err }, 'Message handling failed');
     });
-  });
+  };
+
+  // 融云 Token 到期后会以 31004 登录失败：换发 token 后再重试一次，
+  // 不能沿用旧 token 或重新注册（会产生重复节点）。
+  const connectToRongCloud = async () => {
+    const outcome = await connectWithTokenRefresh(rongClient, messageSink, async () => {
+      const refreshed = await refreshRegisteredToken(config.serverUrl, undefined, log);
+      if (refreshed) config.token = refreshed;
+      return refreshed;
+    });
+    if (outcome.refreshed) log.info('已换发 Token 并重连融云');
+    return outcome;
+  };
+
+  const connectResult = await connectToRongCloud();
 
   if (!connectResult.success) {
     console.error('Failed to connect to RongCloud');
@@ -169,11 +184,7 @@ export async function startStandalone(options: StartStandaloneOptions = {}): Pro
   const rongcloudCheckInterval = setInterval(() => {
     if (!rongClient.isConnected) {
       log.warn('RongCloud disconnected, reconnecting...');
-      rongClient.connect((msg) => {
-        messageHandler.handleMessage(msg).catch((err) => {
-          log.error({ err }, 'Message handling failed');
-        });
-      }).catch((err: any) => {
+      connectToRongCloud().catch((err: any) => {
         log.error({ err }, 'Reconnect failed');
       });
     }

@@ -3,10 +3,12 @@ import { ConfigManager } from './core/config.js';
 import { SessionManager } from './core/session-manager.js';
 import { MessageHandler } from './core/message-handler.js';
 import { RongCloudClient } from './rongcloud/client.js';
+import { connectWithTokenRefresh } from './rongcloud/token-refresh.js';
 import { OpenCodeClient } from './opencode/client.js';
 import { EventHandler } from './opencode/event-handler.js';
 import { createLogger } from './core/logger.js';
-import { getOrRegisterToken, loadAutoConfig, generateNodeId } from './core/auto-register.js';
+import { getOrRegisterToken, loadAutoConfig, generateNodeId, refreshRegisteredToken } from './core/auto-register.js';
+import type { RongCloudMessage } from './core/types.js';
 
 const log = createLogger('plugin');
 
@@ -60,13 +62,20 @@ const ClawMessengerPlugin: Plugin = {
       log.warn({ err }, 'Failed to start event stream');
     }
 
-    const connected = await rongClient.connect((msg) => {
+    const messageSink = (msg: RongCloudMessage) => {
       messageHandler.handleMessage(msg).catch((err) => {
         log.error({ err }, 'Message handling failed');
       });
+    };
+
+    // 融云 Token 到期后会以 31004 登录失败：换发 token 后再重试一次。
+    const connectResult = await connectWithTokenRefresh(rongClient, messageSink, async () => {
+      const refreshed = await refreshRegisteredToken(config.serverUrl, undefined, log);
+      if (refreshed) config.token = refreshed;
+      return refreshed;
     });
 
-    if (!connected) throw new Error('融云连接失败');
+    if (!connectResult.success) throw new Error('融云连接失败');
 
     log.info('ClawMessenger plugin started');
 
